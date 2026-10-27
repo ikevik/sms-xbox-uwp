@@ -1,0 +1,7 @@
+build/
+*.iso
+*.gcm
+*.ciso
+*.msix
+*.pfx
+*.cer

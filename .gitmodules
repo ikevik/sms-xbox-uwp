@@ -1,0 +1,3 @@
+[submodule "ext/sms-pc-port"]
+	path = ext/sms-pc-port
+	url = https://github.com/chasem-dev/sms-pc-port

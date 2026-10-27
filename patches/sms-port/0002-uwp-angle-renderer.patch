@@ -1,0 +1,933 @@
+diff --git a/platform/gx/CMakeLists.txt b/platform/gx/CMakeLists.txt
+index 8c9ea46..3802835 100644
+--- a/platform/gx/CMakeLists.txt
++++ b/platform/gx/CMakeLists.txt
+@@ -64,6 +64,10 @@ if(APPLE)
+     target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+     target_link_libraries(sms_gx PUBLIC "-framework CoreFoundation")
+ endif()
++if(SMS_MSVC_TARGET)
++    # The Windows SDK has no GL/glcorearb.h either (MinGW's headers do).
++    target_include_directories(sms_gx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
++endif()
+ target_compile_features(sms_gx PRIVATE cxx_std_17)
+ # The SDK functions here that compute in floats round every operation as the
+ # DOL's objects do, which MWCC built without contraction: no host compiler may
+@@ -119,6 +123,15 @@ if(WIN32)
+     # HDR output: a Direct3D 11 swap chain shares the frame with OpenGL (gx_hdr.cpp)
+     target_link_libraries(sms_gx PUBLIC d3d11 dxgi)
+ endif()
++if(SMS_UWP)
++    # OpenGL ES through ANGLE on the app's CoreWindow (gx_uwp_egl.cpp); third_party/angle-uwp/README.md.
++    set(_sms_angle ${CMAKE_SOURCE_DIR}/third_party/angle-uwp)
++    target_sources(sms_gx PRIVATE src/gx_uwp_egl.cpp)
++    target_compile_definitions(sms_gx PRIVATE SMS_GX_UWP_ANGLE=1)
++    target_include_directories(sms_gx PRIVATE ${_sms_angle}/include)
++    target_link_libraries(sms_gx PUBLIC ${_sms_angle}/lib/libEGL.dll.lib ${_sms_angle}/lib/libGLESv2.dll.lib)
++    message(STATUS "sms_gx: ANGLE (OpenGL ES) on the CoreWindow, for UWP")
++endif()
+ if(SMS_GX_EGL_LIB AND SMS_GX_EGL_INCLUDE)
+     target_compile_definitions(sms_gx PRIVATE SMS_GX_HAVE_EGL=1)
+     target_link_libraries(sms_gx PUBLIC ${SMS_GX_EGL_LIB})
+diff --git a/platform/gx/src/gl_loader.cpp b/platform/gx/src/gl_loader.cpp
+index 0fde88f..bd87b78 100644
+--- a/platform/gx/src/gl_loader.cpp
++++ b/platform/gx/src/gl_loader.cpp
+@@ -35,6 +35,122 @@ static CallCount s_counts[256];
+ static int s_nCounts = 0;
+ #endif
+ 
++#ifdef SMS_GX_UWP_ANGLE
++// SMS_GX_GLCHECK=1 (UWP build): every GL entry point is followed by a glGetError, and the first errors of each call are
++// logged with the caller's stack (sms.exe+RVA, for sms.map) and, for draws, what glValidateProgram says of the program.
++// ANGLE's GL_KHR_debug messages never came, so this finds the calls that fail. With SMS_GX_GL_THREAD=0 the calls run on the
++// game's thread and the stack shows who made them; with the GL thread, the thread that executes the queue.
++extern "C" void port_uwp_backtrace_text(char* out, size_t size, int skip, int count);  // src/win_posix/uwp_stubs.cpp
++namespace {
++unsigned (*s_rawGetError)();
++void (*s_rawGetIntegerv)(unsigned, int*);
++void (*s_rawValidate)(unsigned);
++void (*s_rawGetProgramiv)(unsigned, unsigned, int*);
++void (*s_rawGetProgramInfoLog)(unsigned, int, int*, char*);
++struct ErrSeen {
++    const char* name;
++    unsigned err;
++    int n;
++};
++ErrSeen s_errSeen[96];
++int s_nErrSeen = 0;
++
++void (*s_rawGetIntegeriv)(unsigned, unsigned, int*);
++void (*s_rawGetBufferParameteriv)(unsigned, unsigned, int*);
++void (*s_rawGetVertexAttribiv)(unsigned, unsigned, int*);
++unsigned (*s_rawCheckFramebufferStatus)(unsigned);
++void (*s_rawGetActiveAttrib)(unsigned, unsigned, int, int*, int*, unsigned*, char*);
++int (*s_rawGetAttribLocation)(unsigned, const char*);
++
++// What a failing draw was drawn with: the bindings and the program's attributes against what each is fed.
++void dumpDrawState(int prog) {
++    int vao = 0, ebo = 0, abo = 0, fbo = 0, ub = 0, ubStart = 0, ubSize = 0, eboSize = 0, eboMapped = 0;
++    s_rawGetIntegerv(0x85B5 /* VERTEX_ARRAY_BINDING */, &vao);
++    s_rawGetIntegerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ebo);
++    s_rawGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &abo);
++    s_rawGetIntegerv(0x8CA6 /* DRAW_FRAMEBUFFER_BINDING */, &fbo);
++    s_rawGetIntegeriv(0x8A28 /* UNIFORM_BUFFER_BINDING */, 0, &ub);
++    s_rawGetIntegeriv(0x8A29 /* UNIFORM_BUFFER_START */, 0, &ubStart);
++    s_rawGetIntegeriv(0x8A2A /* UNIFORM_BUFFER_SIZE */, 0, &ubSize);
++    if (ebo) {
++        s_rawGetBufferParameteriv(0x8893 /* ELEMENT_ARRAY_BUFFER */, 0x8764 /* BUFFER_SIZE */, &eboSize);
++        s_rawGetBufferParameteriv(0x8893, 0x88BC /* BUFFER_MAPPED */, &eboMapped);
++    }
++    gx::logmsg("[GLCHECK]   state: vao %d, element buffer %d (%d bytes, mapped %d), array buffer %d, uniform buffer 0: %d "
++               "(offset %d, size %d), draw framebuffer %d status 0x%X",
++               vao, ebo, eboSize, eboMapped, abo, ub, ubStart, ubSize, fbo, s_rawCheckFramebufferStatus(0x8CA6));
++    int n = 0;
++    s_rawGetProgramiv(unsigned(prog), 0x8B89 /* ACTIVE_ATTRIBUTES */, &n);
++    for (int i = 0; i < n && i < 16; i++) {
++        char name[64] = {0};
++        int len = 0, size = 0;
++        unsigned type = 0;
++        s_rawGetActiveAttrib(unsigned(prog), unsigned(i), sizeof name, &len, &size, &type, name);
++        const int loc = s_rawGetAttribLocation(unsigned(prog), name);
++        int on = 0, integer = 0, buf = 0, comps = 0, atype = 0;
++        if (loc >= 0) {
++            s_rawGetVertexAttribiv(unsigned(loc), 0x8622 /* ARRAY_ENABLED */, &on);
++            s_rawGetVertexAttribiv(unsigned(loc), 0x88FD /* ARRAY_INTEGER */, &integer);
++            s_rawGetVertexAttribiv(unsigned(loc), 0x889F /* ARRAY_BUFFER_BINDING */, &buf);
++            s_rawGetVertexAttribiv(unsigned(loc), 0x8623 /* ARRAY_SIZE */, &comps);
++            s_rawGetVertexAttribiv(unsigned(loc), 0x8625 /* ARRAY_TYPE */, &atype);
++        }
++        gx::logmsg("[GLCHECK]   attribute %s at %d: shader type 0x%X; array %s, integer %d, buffer %d, %d x type 0x%X", name, loc, type,
++                   on ? "on" : "off", integer, buf, comps, atype);
++    }
++    while (s_rawGetError() != 0) {}
++}
++
++void reportGlErrors(const char* name) {
++    for (int k = 0; k < 4; k++) {
++        const unsigned err = s_rawGetError();
++        if (err == 0) return;
++        ErrSeen* seen = nullptr;
++        for (int i = 0; i < s_nErrSeen; i++)
++            if (s_errSeen[i].name == name && s_errSeen[i].err == err) seen = &s_errSeen[i];
++        if (!seen && s_nErrSeen < 96) {
++            seen = &s_errSeen[s_nErrSeen++];
++            *seen = ErrSeen{name, err, 0};
++        }
++        if (!seen || seen->n++ >= 2) continue;  // the first two of each call and error
++        char stack[1000];
++        port_uwp_backtrace_text(stack, sizeof stack, 2, 14);
++        gx::logmsg("[GLCHECK] %s raised 0x%X (#%d)\n    at %s", name, err, seen->n, stack);
++        if (!strncmp(name, "glDraw", 6) || !strncmp(name, "glMultiDraw", 11)) {
++            int prog = 0;
++            s_rawGetIntegerv(0x8B8D /* GL_CURRENT_PROGRAM */, &prog);
++            if (prog) {
++                s_rawValidate(unsigned(prog));
++                int ok = 0;
++                char log[600] = {0};
++                s_rawGetProgramiv(unsigned(prog), 0x8B83 /* GL_VALIDATE_STATUS */, &ok);
++                s_rawGetProgramInfoLog(unsigned(prog), sizeof log, nullptr, log);
++                gx::logmsg("[GLCHECK]   program %d: validate %s: %s", prog, ok ? "ok" : "failed", log);
++                dumpDrawState(prog);
++                while (s_rawGetError() != 0) {}
++            } else {
++                gx::logmsg("[GLCHECK]   no program in use");
++            }
++        }
++    }
++}
++}  // namespace
++
++template <typename F> struct Checked;
++template <typename R, typename... A> struct Checked<R (*)(A...)> {
++    template <R (**Real)(A...), const char* const* Name> static R call(A... a) {
++        if constexpr (std::is_void<R>::value) {
++            (*Real)(a...);
++            reportGlErrors(*Name);
++        } else {
++            R r = (*Real)(a...);
++            reportGlErrors(*Name);
++            return r;
++        }
++    }
++};
++#endif
++
+ // Logs the entry points called most since the previous call (SMS_GX_STATS).
+ void logTopCalls(uint32_t frames) {
+ #if !(defined(_WIN32) && !defined(_WIN64))
+@@ -70,6 +186,36 @@ bool load(void* (*getProc)(const char*)) {
+ #define SMS_GX_LOAD_OPTIONAL(type, name) gx_##name = reinterpret_cast<type>(getProc(#name));
+     SMS_GX_GL_OPTIONAL_FUNCS(SMS_GX_LOAD_OPTIONAL)
+ #undef SMS_GX_LOAD_OPTIONAL
++#ifdef SMS_GX_UWP_ANGLE
++    if (getenv("SMS_GX_GLCHECK")) {
++        s_rawGetError = reinterpret_cast<unsigned (*)()>(getProc("glGetError"));
++        s_rawGetIntegerv = reinterpret_cast<void (*)(unsigned, int*)>(getProc("glGetIntegerv"));
++        s_rawValidate = reinterpret_cast<void (*)(unsigned)>(getProc("glValidateProgram"));
++        s_rawGetProgramiv = reinterpret_cast<void (*)(unsigned, unsigned, int*)>(getProc("glGetProgramiv"));
++        s_rawGetProgramInfoLog = reinterpret_cast<void (*)(unsigned, int, int*, char*)>(getProc("glGetProgramInfoLog"));
++        s_rawGetIntegeriv = reinterpret_cast<void (*)(unsigned, unsigned, int*)>(getProc("glGetIntegeri_v"));
++        s_rawGetBufferParameteriv = reinterpret_cast<void (*)(unsigned, unsigned, int*)>(getProc("glGetBufferParameteriv"));
++        s_rawGetVertexAttribiv = reinterpret_cast<void (*)(unsigned, unsigned, int*)>(getProc("glGetVertexAttribiv"));
++        s_rawCheckFramebufferStatus = reinterpret_cast<unsigned (*)(unsigned)>(getProc("glCheckFramebufferStatus"));
++        s_rawGetActiveAttrib = reinterpret_cast<void (*)(unsigned, unsigned, int, int*, int*, unsigned*, char*)>(getProc("glGetActiveAttrib"));
++        s_rawGetAttribLocation = reinterpret_cast<int (*)(unsigned, const char*)>(getProc("glGetAttribLocation"));
++        if (s_rawGetError && s_rawGetIntegerv && s_rawValidate && s_rawGetProgramiv && s_rawGetProgramInfoLog && s_rawGetIntegeriv &&
++            s_rawGetBufferParameteriv && s_rawGetVertexAttribiv && s_rawCheckFramebufferStatus && s_rawGetActiveAttrib &&
++            s_rawGetAttribLocation) {
++#define SMS_GX_CHECK(type, name)                                                                         \
++            if (strcmp(#name, "glGetError")) {                                                           \
++                static type real_##name;                                                                 \
++                static const char* const nm_##name = #name;                                              \
++                real_##name = gx_##name;                                                                 \
++                if (real_##name) gx_##name = &Checked<type>::template call<&real_##name, &nm_##name>;    \
++            }
++            SMS_GX_GL_FUNCS(SMS_GX_CHECK)
++            SMS_GX_GL_OPTIONAL_FUNCS(SMS_GX_CHECK)
++#undef SMS_GX_CHECK
++            gx::logmsg("GL call checking on (SMS_GX_GLCHECK)");
++        }
++    }
++#endif
+ #if !(defined(_WIN32) && !defined(_WIN64))
+     if (getenv("SMS_GX_STATS")) {
+ #define SMS_GX_WRAP(type, name)                                   \
+diff --git a/platform/gx/src/gx_hdr.cpp b/platform/gx/src/gx_hdr.cpp
+index 8ad2197..5a92780 100644
+--- a/platform/gx/src/gx_hdr.cpp
++++ b/platform/gx/src/gx_hdr.cpp
+@@ -51,7 +51,7 @@
+ #include <string>
+ #include <vector>
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) && !defined(SMS_UWP)  // HDR uses DirectComposition and display queries UWP lacks
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+ #endif
+@@ -59,7 +59,12 @@
+ #define NOMINMAX
+ #endif
+ #include <windows.h>
++#ifdef _MSC_VER
++// The Windows SDK's d3d11.h pulls in d3d10_1.h, which refuses to follow d3d10.h.
++#include <d3d10_1.h>
++#else
+ #include <d3d10.h>
++#endif
+ #include <d3d11_4.h>
+ #include <d3dcompiler.h>
+ #include <dcomp.h>
+@@ -74,7 +79,7 @@ namespace gx {
+ unsigned g_presentFbo = 0;
+ }
+ 
+-#ifdef _WIN32
++#if defined(_WIN32) && !defined(SMS_UWP)
+ namespace {
+ using gx::logmsg;
+ 
+diff --git a/platform/gx/src/gx_hires.cpp b/platform/gx/src/gx_hires.cpp
+index a4cc9d1..8945935 100644
+--- a/platform/gx/src/gx_hires.cpp
++++ b/platform/gx/src/gx_hires.cpp
+@@ -23,6 +23,9 @@
+ // Late textures show their original until a bounded frame-end upload finishes.
+ #include "gx_internal.h"
+ #include "gl_funcs.h"
++#ifdef SMS_GX_UWP_ANGLE
++#include "gx_uwp_egl.h"
++#endif
+ #include "gx_glcache.h"
+ #include "gx_glthread.h"
+ #include "gx_path.h"
+@@ -1558,8 +1561,15 @@ static void touchFresh() {
+         static const char* kFs = "#version 330 core\nuniform sampler2D t;\nout vec4 o;\n"
+                                  "void main() { o = textureLod(t, vec2(0.5), 0.0); }\n";
+         GLuint v = glCreateShader(GL_VERTEX_SHADER), f = glCreateShader(GL_FRAGMENT_SHADER);
+-        glShaderSource(v, 1, &kVs, nullptr);
+-        glShaderSource(f, 1, &kFs, nullptr);
++        const char* vsSrc = kVs;
++        const char* fsSrc = kFs;
++#ifdef SMS_GX_UWP_ANGLE
++        const std::string esVs = uwp::toEs300(kVs), esFs = uwp::toEs300(kFs);
++        vsSrc = esVs.c_str();
++        fsSrc = esFs.c_str();
++#endif
++        glShaderSource(v, 1, &vsSrc, nullptr);
++        glShaderSource(f, 1, &fsSrc, nullptr);
+         glCompileShader(v);
+         glCompileShader(f);
+         s_touchProg = glCreateProgram();
+diff --git a/platform/gx/src/gx_platform.cpp b/platform/gx/src/gx_platform.cpp
+index 5843f37..f0c4dc3 100644
+--- a/platform/gx/src/gx_platform.cpp
++++ b/platform/gx/src/gx_platform.cpp
+@@ -49,6 +49,9 @@
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ #endif
++#ifdef SMS_GX_UWP_ANGLE
++#include "gx_uwp_egl.h"
++#endif
+ #ifdef SMS_GX_HAVE_VULKAN
+ #include "vk/glvk.h"
+ #ifdef SMS_GX_HAVE_SDL2
+@@ -69,7 +72,7 @@ extern double g_presentSeconds, g_swapSeconds;
+ using namespace gx;
+ 
+ namespace {
+-enum Mode { MODE_NONE, MODE_WINDOW, MODE_HEADLESS, MODE_EXTERNAL };
++enum Mode { MODE_NONE, MODE_WINDOW, MODE_HEADLESS, MODE_EXTERNAL, MODE_UWP };
+ Mode s_mode = MODE_NONE;
+ int s_forceHeadless = -1;  // -1: decide from the environment
+ bool s_autoPresent = true;
+@@ -874,6 +877,31 @@ bool openHeadless(float scale) {
+ }
+ #endif
+ 
++#ifdef SMS_GX_UWP_ANGLE
++// The UWP build: the ES context ANGLE made on the CoreWindow (GXPC_UwpAttachWindow, on the UI thread) moves to the GL thread,
++// as openHeadless does with its context.
++bool openUwp(float scale) {
++    if (!uwp::available()) {
++        logmsg("UWP: no ANGLE window context (GXPC_UwpAttachWindow made none)");
++        return false;
++    }
++    if (!uwp::makeCurrent()) {
++        logmsg("UWP: the ANGLE context cannot be made current");
++        return false;
++    }
++    uwp::enableGlDebug();
++    const bool ok = GXPC_Init(uwp::getProc, scale) != 0;
++    uwp::releaseCurrent();
++    if (!ok) {
++        logmsg("UWP: the renderer could not start on OpenGL ES 3.0 (entry points or framebuffer: see above)");
++        return false;
++    }
++    if (glt::start([](void*) { uwp::makeCurrent(); }, nullptr)) glt::installProxies();
++    else uwp::makeCurrent();
++    return true;
++}
++#endif
++
+ #ifdef SMS_GX_HAVE_VULKAN
+ bool openHeadlessVulkan(float scale) {
+     glvk::InitInfo vi;
+@@ -1186,7 +1214,11 @@ int GXPC_MouseCaptured(void) {
+     return 0;
+ #endif
+ }
++#ifdef SMS_GX_HAVE_SDL2
+ int GXPC_GameInputBlocked(void) { return menuVisible(); }
++#else
++int GXPC_GameInputBlocked(void) { return 0; }  // no window, no menus (menuVisible needs SDL2)
++#endif
+ int GXPC_RequestQuit(void) {
+ #ifdef SMS_GX_HAVE_SDL2
+     if (s_mode != MODE_WINDOW || !s_window) return 0;
+@@ -1206,7 +1238,7 @@ void GXPC_SettingsMenuOpen(int open) {
+     if (open) GXPC_SavePipelineCacheSoon();
+ }
+ int GXPC_SettingsMenuIsOpen(void) { return s_settingsMenuOpen ? 1 : 0; }
+-int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW; }
++int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW && s_mode != MODE_UWP; }
+ uint32_t GXPC_FrameCount(void) { return s_frame; }
+ 
+ int GXPC_InitAuto(float efbScale) {
+@@ -1227,6 +1259,16 @@ int GXPC_InitAuto(float efbScale) {
+     // findDesktop for a session that lost DISPLAY / WAYLAND_DISPLAY).
+     else headless = false;
+     g_displayCopyHook = onDisplayCopy;
++#ifdef SMS_GX_UWP_ANGLE
++    // UWP has no SDL2 window and no desktop OpenGL: ANGLE's OpenGL ES on the CoreWindow, or nothing.
++    if (openUwp(efbScale)) {
++        s_mode = MODE_UWP;
++        logmsg("UWP: OpenGL ES renderer ready");
++        return 1;
++    }
++    logmsg("UWP: no OpenGL ES renderer; rendering is disabled");
++    return 0;
++#endif
+ #ifdef SMS_GX_HAVE_SDL2
+     if (!headless) {
+         if (openWindowAnyBackend(efbScale)) {
+@@ -1344,6 +1386,26 @@ void GXPC_Present(const void* xfb) {
+ #else
+     (void)xfb;
+ #endif
++#ifdef SMS_GX_UWP_ANGLE
++    if (s_mode == MODE_UWP) {
++        int w = 0, h = 0;
++        uwp::surfaceSize(&w, &h);
++        // on the GL thread, after what the frame queued: the picture, then the swap (which waits for vertical sync)
++        glt::sync([&] {
++            static const bool pattern = getenv("SMS_UWP_TEST_PATTERN") != nullptr;
++            int shown = 1;
++            if (pattern) {
++                uwp::testPattern(s_frame);
++            } else {
++                shown = GXPC_PresentXFB(xfb, w, h);
++                GXPC_OverlayDraw(w, h);
++            }
++            uwp::frameProbe(w, h, s_frame, shown);
++            uwp::swap();
++        });
++        GXPC_EndPresent();
++    }
++#endif
+ #ifdef SMS_GX_HAVE_VULKAN
+     // headless: no window to show, but the frame's commands are submitted
+     // (with as many frames in flight as a window has), as a GL driver would
+@@ -1354,6 +1416,8 @@ void GXPC_Present(const void* xfb) {
+ void sms_gx_set_event_callback(void (*cb)(const union SDL_Event*)) {
+ #ifdef SMS_GX_HAVE_SDL2
+     s_eventCb = cb;
++#elif defined(SMS_GX_UWP_ANGLE)
++    uwp::setEventCallback(reinterpret_cast<void (*)(const void*)>(cb));
+ #else
+     (void)cb;
+ #endif
+@@ -1395,6 +1459,9 @@ static void noteInputDevice(const SDL_Event& ev) {
+ #endif
+ 
+ void sms_gx_pump_events(void) {
++#ifdef SMS_GX_UWP_ANGLE
++    uwp::pumpInput();
++#endif
+ #ifdef SMS_GX_HAVE_SDL2
+     if (s_mode != MODE_WINDOW) return;
+     applyWindowRequests();
+@@ -1652,6 +1719,8 @@ int sms_gx_rumble(unsigned short strength) {
+     s_rumble.pad = s_rumblePad;
+     s_rumble.called = true;
+     return s_rumblePad >= 0;
++#elif defined(SMS_GX_UWP_ANGLE)
++    return uwp::rumble(strength);
+ #else
+     (void)strength;
+     return 0;
+@@ -1668,6 +1737,8 @@ void sms_gx_rumble_shutdown(void) {
+     }
+     std::lock_guard<std::mutex> l(s_padLock);
+     for (const Pad& p : s_pads) SDL_GameControllerRumble(p.c, 0, 0, 0);
++#elif defined(SMS_GX_UWP_ANGLE)
++    uwp::rumble(0);
+ #endif
+ }
+ 
+diff --git a/platform/gx/src/gx_render.cpp b/platform/gx/src/gx_render.cpp
+index 2b02640..d159a48 100644
+--- a/platform/gx/src/gx_render.cpp
++++ b/platform/gx/src/gx_render.cpp
+@@ -3,6 +3,14 @@
+ // presentation.
+ #include "gx_internal.h"
+ #include "gl_funcs.h"
++#ifdef SMS_GX_UWP_ANGLE
++#include "gx_uwp_egl.h"
++#endif
++#ifdef SMS_GX_UWP_ANGLE
++// ES has only the boolean occlusion query (the game's counts become 0 or 1).
++#undef GL_SAMPLES_PASSED
++#define GL_SAMPLES_PASSED GL_ANY_SAMPLES_PASSED
++#endif
+ #include "gx_glcache.h"
+ #include "gx_glthread.h"
+ #include "gx_nis_coef.h"
+@@ -160,6 +168,20 @@ struct StreamPiece {
+     size_t bytes, align;
+     size_t at;  // out: offset written at, a multiple of align
+ };
++#ifdef SMS_GX_UWP_ANGLE
++// ANGLE's Direct3D 11 backend keeps a separate copy of a buffer for each way it is used, and copies the whole buffer between
++// them after a write. One big buffer holding vertices, indices and the uniform block (which is what a desktop driver is
++// happiest with) made the title run at 3 frames a second and take the app's whole memory in a minute (sms-16.log). Here
++// each role has a buffer of its own (the vertices are StreamBuffer::buf), and a batch replaces each one whole with
++// glBufferData, so only what the batch uses is moved.
++static GLuint s_uwpIbo = 0, s_uwpUbo = 0;
++static void uwpUpload(GLuint buf, const void* data, size_t bytes, GLenum usage) {
++    glt::postData(data, bytes, [buf, bytes, usage](const uint8_t* d) {
++        glBindBuffer(GL_COPY_WRITE_BUFFER, buf);  // a target no VAO records
++        glBufferData(GL_COPY_WRITE_BUFFER, GLsizeiptr(bytes), d, usage);
++    });
++}
++#endif
+ struct StreamBuffer {
+     enum { kSegments = 4 };
+     GLuint buf = 0;
+@@ -175,6 +197,14 @@ struct StreamBuffer {
+     void init(size_t bytes, size_t extra) {
+         size = bytes;
+         const size_t total = bytes + extra;
++#ifdef SMS_GX_UWP_ANGLE
++        // see s_uwpIbo: each role has a buffer of its own, filled whole per batch
++        glGenBuffers(1, &buf);
++        glGenBuffers(1, &s_uwpIbo);
++        glGenBuffers(1, &s_uwpUbo);
++        (void)total;
++        return;
++#endif
+         glGenBuffers(1, &buf);
+         glcBindArrayBuffer(buf);
+         const char* e = getenv("SMS_GX_PERSISTENT_MAP");
+@@ -280,7 +310,15 @@ struct StreamBuffer {
+     }
+ };
+ static StreamBuffer s_stream;
++#ifdef SMS_GX_UWP_ANGLE
++// ANGLE's Direct3D 11 backend keeps a copy of a buffer for each way it is used (vertices, indices, the CPU's writes), so
++// this one buffer costs several times its size of the app's 1 GiB: 128 + 64 MiB took 400 MiB and then more.
++static const size_t kArenaBytes = size_t(16) << 20;  // the display-list arena after the ring
++static const size_t kStreamBytes = size_t(32) << 20;
++#else
+ static const size_t kArenaBytes = size_t(64) << 20;  // the display-list arena after the ring
++static const size_t kStreamBytes = size_t(128) << 20;
++#endif
+ static GLint s_uboAlign = 256;
+ 
+ // One VAO per packed vertex format: attribute pointers into the vertex stream
+@@ -288,19 +326,49 @@ static GLint s_uboAlign = 256;
+ // set in rendererInit (matrix indices: set per batch in flushBatch).
+ static std::unordered_map<uint32_t, GLuint> s_fmtVaos;
+ 
++#ifdef SMS_GX_UWP_ANGLE
++// OpenGL ES 3.0 has no base-vertex draws (an extension ANGLE's Direct3D 11 backend may lack): where the context cannot do
++// them, a draw with a base vertex moves the attribute pointers of its VAO by base * stride instead. The attributes of
++// each VAO made here are kept for that.
++struct VaoAttr {
++    GLuint index;
++    GLint n;
++    GLenum type;
++    GLboolean norm;
++    size_t off;
++    bool integer;
++};
++struct VaoShape {
++    GLsizei stride = 0;
++    std::vector<VaoAttr> attrs;
++};
++static std::unordered_map<GLuint, VaoShape> s_vaoShapes;
++#endif
++
+ static GLuint makeVao(uint32_t fmt, GLuint buf) {
+     GLuint vao;
+     const VtxFmtLayout& l = vtxFmtLayout(fmt);
+     glGenVertexArrays(1, &vao);
+     glcBindVertexArray(vao);
++#ifdef SMS_GX_UWP_ANGLE
++    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_uwpIbo);
++#else
+     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buf);
++#endif
+     glcBindArrayBuffer(buf);
+     const GLsizei st = l.stride;
+     auto off = [](size_t o) { return reinterpret_cast<const void*>(o); };
++#ifdef SMS_GX_UWP_ANGLE
++    VaoShape& shape = s_vaoShapes[vao];
++    shape.stride = st;
++#endif
+     auto attr = [&](GLuint i, bool on, GLint n, GLenum type, GLboolean norm, size_t o) {
+         if (!on) return;
+         glVertexAttribPointer(i, n, type, norm, st, off(o));
+         glEnableVertexAttribArray(i);
++#ifdef SMS_GX_UWP_ANGLE
++        shape.attrs.push_back(VaoAttr{i, n, type, norm, o, false});
++#endif
+     };
+     attr(0, true, 3, GL_FLOAT, GL_FALSE, 0);
+     attr(1, fmt & VF_NRM, 3, GL_FLOAT, GL_FALSE, l.nrm);
+@@ -312,10 +380,39 @@ static GLuint makeVao(uint32_t fmt, GLuint buf) {
+     if (fmt & VF_MTX) {
+         glVertexAttribIPointer(14, 3, GL_UNSIGNED_INT, st, off(l.mtx));
+         glEnableVertexAttribArray(14);
++#ifdef SMS_GX_UWP_ANGLE
++        shape.attrs.push_back(VaoAttr{14, 3, GL_UNSIGNED_INT, GL_FALSE, l.mtx, true});
++#endif
+     }
+     return vao;
+ }
+ 
++// glDrawElementsBaseVertex for the indices at byte offset `iOff` of the element buffer (GL_UNSIGNED_INT), with `vao` bound.
++static void drawElementsBase(GLuint vao, GLenum mode, GLsizei count, size_t iOff, GLint base) {
++#ifdef SMS_GX_UWP_ANGLE
++    if (!base) {
++        glDrawElements(mode, count, GL_UNSIGNED_INT, reinterpret_cast<const void*>(iOff));
++        return;
++    }
++    if (!gx::uwp::nativeBaseVertex()) {
++        const VaoShape& shape = s_vaoShapes[vao];
++        auto point = [&](GLint vertexBase) {
++            glcBindArrayBuffer(s_stream.buf);  // the pointers take the array buffer bound now
++            for (const VaoAttr& a : shape.attrs) {
++                const void* at = reinterpret_cast<const void*>(a.off + size_t(vertexBase) * size_t(shape.stride));
++                if (a.integer) glVertexAttribIPointer(a.index, a.n, a.type, shape.stride, at);
++                else glVertexAttribPointer(a.index, a.n, a.type, a.norm, shape.stride, at);
++            }
++        };
++        if (base) point(base);
++        glDrawElements(mode, count, GL_UNSIGNED_INT, reinterpret_cast<const void*>(iOff));
++        if (base) point(0);  // the VAO's other draws expect its pointers at the start
++        return;
++    }
++#endif
++    glDrawElementsBaseVertex(mode, count, GL_UNSIGNED_INT, reinterpret_cast<const void*>(iOff), base);
++}
++
+ static GLuint vaoForFormat(uint32_t fmt) {
+     GLuint& vao = s_fmtVaos[fmt];
+     if (!vao) vao = makeVao(fmt, s_stream.buf);
+@@ -385,6 +482,10 @@ bool rendererReady() { return s_ready; }
+ static GLuint compileProgram(const char* vs, const char* fs) {
+     auto sh = [](GLenum t, const char* src) {
+         GLuint s = glCreateShader(t);
++#ifdef SMS_GX_UWP_ANGLE
++        const std::string es = uwp::toEs300(src);
++        src = es.c_str();
++#endif
+         glShaderSource(s, 1, &src, nullptr);
+         glCompileShader(s);
+         GLint ok = 0;
+@@ -402,6 +503,15 @@ static GLuint compileProgram(const char* vs, const char* fs) {
+     glAttachShader(p, f);
+     glBindFragDataLocation(p, 0, "o_color");
+     glLinkProgram(p);
++    {
++        GLint linked = 0;
++        glGetProgramiv(p, GL_LINK_STATUS, &linked);
++        if (!linked) {
++            char log[2048];
++            glGetProgramInfoLog(p, sizeof log, nullptr, log);
++            logmsg("internal program link failed: %s", log);
++        }
++    }
+     glDeleteShader(v);
+     glDeleteShader(f);
+     return p;
+@@ -1398,7 +1508,7 @@ void rendererInit(float efbScale) {
+     glcInvalidate();
+     glGenVertexArrays(1, &s_vao);
+     glcBindVertexArray(s_vao);
+-    s_stream.init(128u << 20, kArenaBytes);
++    s_stream.init(kStreamBytes, kArenaBytes);
+     // Values of the attributes a packed format leaves out (see vaoForFormat):
+     // the same defaults the loader used to write into every vertex.
+     glVertexAttrib4f(1, 0.0f, 0.0f, 1.0f, 1.0f);  // normal
+@@ -1552,6 +1662,10 @@ uint32_t arenaGeneration() { return s_arenaGen; }
+ 
+ bool arenaUpload(const uint8_t* verts, uint32_t n, uint32_t stride, const uint32_t* idx, uint32_t nidx, ArenaRef& out) {
+     const size_t vbytes = size_t(n) * stride, ibytes = size_t(nidx) * 4, need = vbytes + stride + ibytes + 4;
++#ifdef SMS_GX_UWP_ANGLE
++    (void)need;
++    return false;  // the display-list arena lives in the big stream buffer, which this target does not have (see s_uwpIbo)
++#endif
+     if (!s_ready || need > kArenaBytes / 8) return false;
+     if (s_arenaPos + need > kArenaBytes) {  // start over, once nothing drawn from the arena is pending
+         flushBatch();
+@@ -2371,6 +2485,31 @@ void flushBatch() {
+             glVertexAttribI4ui(14, m[0], m[1], m[2], 0);
+         }
+     }
++#ifdef SMS_GX_UWP_ANGLE
++    // this batch's XF block (when it changed), vertices and indices, each into its own buffer (see s_uwpIbo)
++    static uint32_t xfBlock[736];
++    static bool s_uboFilled = false;
++    const bool streamed = s_bidx.size != 0;
++    if (s_xfDirty || !s_uboFilled) {
++        memcpy(xfBlock, &g.xfMem[0], 256 * 4);
++        memcpy(xfBlock + 256, &g.xfMem[0x400], 96 * 4);
++        memcpy(xfBlock + 352, &g.xfMem[0x500], 256 * 4);
++        memcpy(xfBlock + 608, &g.xfMem[0x600], 128 * 4);
++        uwpUpload(s_uwpUbo, xfBlock, sizeof(xfBlock), GL_DYNAMIC_DRAW);
++        s_xfDirty = false;
++        s_uboFilled = true;
++    }
++    if (g_glc.uniformBuffer != s_uwpUbo) {
++        glBindBufferBase(GL_UNIFORM_BUFFER, 0, s_uwpUbo);  // the base bind also sets the generic binding
++        g_glc.uniformBuffer = s_uwpUbo;
++    }
++    if (streamed) {
++        uwpUpload(s_stream.buf, s_bdata.data, s_bdata.size, GL_STREAM_DRAW);
++        uwpUpload(s_uwpIbo, s_bidx.data, s_bidx.size * 4, GL_STREAM_DRAW);
++    }
++    const size_t iOff = 0;
++    const GLint streamBase = 0;
++#else
+     // this batch's XF block (when it changed), vertices and indices, in one map
+     static uint32_t xfBlock[736];
+     static size_t s_xfOffset = 0;
+@@ -2402,6 +2541,7 @@ void flushBatch() {
+     }
+     const size_t vOff = streamed ? pc[np - 2].at : 0, iOff = streamed ? pc[np - 1].at : 0;
+     const GLint streamBase = GLint(vOff / s_bstride);
++#endif
+     GLenum mode = s_bclass == PRIM_TRIS ? GL_TRIANGLES : s_bclass == PRIM_LINES ? GL_LINES : GL_POINTS;
+     bool earlyFallback = !shaderHasEarlyFragmentTests() && earlyZWritesRejected();
+     // The batch's index ranges in order: (VAO, byte offset of the indices, count, base vertex).
+@@ -2437,16 +2577,16 @@ void flushBatch() {
+         for (const Range& r : ranges) {
+             glcBindVertexArray(r.vao);
+             for (size_t i = 0; i < size_t(r.count); i += step) {
+-                const void* indices = reinterpret_cast<const void*>(r.iOff + i * 4);
++                const size_t indices = r.iOff + i * 4;
+                 glcUseProgram(sp->prog);
+                 glColorMask(masks[0], masks[1], masks[2], masks[3]);
+                 glDepthMask(GL_FALSE);
+-                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
++                drawElementsBase(r.vao, mode, GLsizei(step), indices, r.base);
+                 pixMetricPause();
+                 glcUseProgram(depthSp->prog);
+                 glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+                 glDepthMask(GL_TRUE);
+-                glDrawElementsBaseVertex(mode, GLsizei(step), GL_UNSIGNED_INT, indices, r.base);
++                drawElementsBase(r.vao, mode, GLsizei(step), indices, r.base);
+                 pixMetricResume();
+             }
+         }
+@@ -2462,9 +2602,15 @@ void flushBatch() {
+             while (j < ranges.size() && ranges[j].vao == ranges[i].vao) j++;
+             glcBindVertexArray(ranges[i].vao);
+             if (j == i + 1) {
+-                glDrawElementsBaseVertex(mode, ranges[i].count, GL_UNSIGNED_INT,
+-                                         reinterpret_cast<const void*>(ranges[i].iOff), ranges[i].base);
+-            } else {
++                drawElementsBase(ranges[i].vao, mode, ranges[i].count, ranges[i].iOff, ranges[i].base);
++            }
++#ifdef SMS_GX_UWP_ANGLE
++            else {  // glMultiDrawElementsBaseVertexEXT needs an extension this context does not have
++                for (size_t k = i; k < j; k++) drawElementsBase(ranges[k].vao, mode, ranges[k].count, ranges[k].iOff, ranges[k].base);
++            }
++#endif
++#ifndef SMS_GX_UWP_ANGLE
++            else {
+                 counts.clear();
+                 offsets.clear();
+                 bases.clear();
+@@ -2476,6 +2622,7 @@ void flushBatch() {
+                 glMultiDrawElementsBaseVertex(mode, counts.data(), GL_UNSIGNED_INT, offsets.data(), GLsizei(j - i),
+                                               bases.data());
+             }
++#endif
+             i = j;
+         }
+     }
+@@ -3132,12 +3279,28 @@ static void prefetchPeeks() {
+         }
+ }
+ 
++#ifdef SMS_GX_UWP_ANGLE
++static GLuint peekSource(bool depth);
++// The depth a depth peek reads is drawn as colour (peekDepthPass): red, green and blue hold its 24 bits, high byte first.
++// This gives what glReadPixels(GL_DEPTH_COMPONENT, GL_UNSIGNED_INT) gives, the depth in the top 24 bits.
++static uint32_t depthFromRgba(uint32_t p) { return (p & 0xFF) << 24 | ((p >> 8) & 0xFF) << 16 | ((p >> 16) & 0xFF) << 8; }
++#endif
++
+ static uint32_t peekSync(int x, int y, bool depth) {
+     glcInvalidate();
+     GxTimer tw(&s_waitSeconds);
+     s_syncReads++;
+     uint32_t v = 0;
+     uint8_t px[4] = {0, 0, 0, 0};
++#ifdef SMS_GX_UWP_ANGLE
++    if (depth) {  // OpenGL ES reads colour only: see peekDepthPass
++        if (x < 0 || y < 0 || x >= s_efbW || y >= EFB_H) return 0;
++        glBindFramebuffer(GL_FRAMEBUFFER, peekSource(true));
++        glPixelStorei(GL_PACK_ALIGNMENT, 1);
++        glReadPixels(x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
++        return depthFromRgba(uint32_t(px[0]) | uint32_t(px[1]) << 8 | uint32_t(px[2]) << 16 | uint32_t(px[3]) << 24);
++    }
++#endif
+     glBindFramebuffer(GL_FRAMEBUFFER, efbReadFbo(scaled(x), scaled(y), scaled(x) + 1, scaled(y) + 1,
+                                                  depth ? GL_DEPTH_BUFFER_BIT : GL_COLOR_BUFFER_BIT));
+     if (depth) {
+@@ -3173,6 +3336,33 @@ static GLuint peekSource(bool depth) {
+     }
+     glDisable(GL_SCISSOR_TEST);
+     const GLuint src = efbReadFbo(0, 0, INT32_MAX, INT32_MAX, bits);
++#ifdef SMS_GX_UWP_ANGLE
++    if (depth) {  // OpenGL ES cannot read depth back: draw it as colour into the same 1x buffer, and read that
++        glBindFramebuffer(GL_FRAMEBUFFER, s_peekFbo);
++        glViewport(0, 0, s_efbW, EFB_H);
++        glDisable(GL_BLEND);
++        glDisable(GL_DEPTH_TEST);
++        glDisable(GL_CULL_FACE);
++        glDisable(GL_CLIP_DISTANCE0);
++        glDisable(GL_CLIP_DISTANCE0 + 1);
++        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++        glUseProgram(s_copyProg);
++        glActiveTexture(GL_TEXTURE1);
++        glBindTexture(GL_TEXTURE_2D, s_efbDepth);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, s_efbColor);
++        const float whole[4] = {0.0f, 0.0f, 1.0f, 1.0f};
++        const float noSrc[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // z = 0: a filtered read at the texel centres
++        glUniform4fv(s_copyURect, 1, whole);
++        glUniform4fv(s_copyUSrc, 1, noSrc);
++        glUniform1i(s_copyUMode, 32 | 6);  // the EFB copy's Z24X8: red, green, blue = bits 23-16, 15-8, 7-0
++        glUniform1i(s_copyUAlphaOne, 1);
++        glBindVertexArray(s_copyVao);
++        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++        glBindVertexArray(s_vao);
++        return s_peekFbo;
++    }
++#endif
+     glBindFramebuffer(GL_READ_FRAMEBUFFER, src);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, s_peekFbo);
+     glBlitFramebuffer(0, 0, scaled(s_efbW), scaled(EFB_H), 0, 0, s_efbW, EFB_H, bits, GL_NEAREST);
+@@ -3243,8 +3433,12 @@ static uint32_t peekRaw(int x, int y, bool depth) {
+         glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+         glBindFramebuffer(GL_READ_FRAMEBUFFER, peekSource(depth));
+         glPixelStorei(GL_PACK_ALIGNMENT, 4);
++#ifdef SMS_GX_UWP_ANGLE
++        glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);  // depth was drawn as colour (peekSource)
++#else
+         if (depth) glReadPixels(0, 0, s_efbW, EFB_H, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+         else glReadPixels(0, 0, s_efbW, EFB_H, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++#endif
+         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+         glBindFramebuffer(GL_FRAMEBUFFER, s_efbFbo);
+         now.fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+@@ -3263,6 +3457,9 @@ static uint32_t peekRaw(int x, int y, bool depth) {
+         if (prev.map) {
+             uint32_t v;
+             memcpy(&v, prev.map + (size_t(y) * s_efbW + x) * 4, 4);
++#ifdef SMS_GX_UWP_ANGLE
++            if (depth) v = depthFromRgba(v);
++#endif
+             return v;
+         }
+     }
+@@ -3632,3 +3829,73 @@ void GXPC_GetStats(GXPCStats* out) {
+ }
+ 
+ }  // extern "C"
++
++#ifdef SMS_GX_UWP_ANGLE
++namespace gx {
++namespace uwp {
++
++void testPattern(unsigned frame) {
++    glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    glDisable(GL_SCISSOR_TEST);
++    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
++    const float k = (frame % 180) / 180.0f;
++    glClearColor(k, 1.0f - k, 0.4f, 1.0f);
++    glClear(GL_COLOR_BUFFER_BIT);
++}
++
++void frameProbe(int w, int h, unsigned frame, int presented) {
++    static int errorsLogged = 0, probes = 0;
++    for (int n = 0; n < 4; n++) {
++        const GLenum err = glGetError();
++        if (err == GL_NO_ERROR) break;
++        if (errorsLogged++ < 30) logmsg("[ES] glGetError 0x%X at frame %u", (unsigned)err, frame);
++    }
++    if (!(frame < 4 || frame % 150 == 0) || probes >= 24) return;
++    probes++;
++    GLint fbo = -1;
++    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
++    char line[600];
++    int len = snprintf(line, sizeof line, "[ES] frame %u: PresentXFB=%d, fbo %d, back buffer %dx%d, rgb at 3x5 points:", frame,
++                       presented, fbo, w, h);
++    for (int row = 0; row < 3; row++)
++        for (int col = 0; col < 5; col++) {
++            unsigned char px[4] = {0, 0, 0, 0};
++            glReadPixels((w - 1) * (col + 1) / 6, (h - 1) * (row + 1) / 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
++            len += snprintf(line + len, sizeof line - size_t(len), " %02x%02x%02x", px[0], px[1], px[2]);
++        }
++    logmsg("%s", line);
++    logmsg("[ES] frame %u: the game's last display frame drew %u batches, %u vertices, %u texture uploads, %u EFB copies; "
++           "so far %u shaders compiled, %u texture uploads",
++           frame, s_lastFrameStats.draws, s_lastFrameStats.vertices, s_lastFrameStats.textureUploads, s_lastFrameStats.efbCopies,
++           (unsigned)g_statShaderCompiles, (unsigned)g_statTexUploads);
++    // the same points in the picture handed to the present (the XFB's texture) and in the EFB's colour texture: black
++    // here and not in the XFB means the present's draw is the fault; black in the XFB means the game's own drawing (or
++    // the copy into the XFB) is
++    auto sample = [&](const char* what, GLuint tex, int tw, int th) {
++        if (!tex || tw <= 0 || th <= 0) return;
++        glBindFramebuffer(GL_FRAMEBUFFER, s_tmpFbo);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
++        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++        int n = snprintf(line, sizeof line, "[ES] frame %u: %s %dx%d (framebuffer 0x%X):", frame, what, tw, th, (unsigned)status);
++        if (status == GL_FRAMEBUFFER_COMPLETE)
++            for (int row = 0; row < 3; row++)
++                for (int col = 0; col < 5; col++) {
++                    unsigned char px[4] = {0, 0, 0, 0};
++                    glReadPixels((tw - 1) * (col + 1) / 6, (th - 1) * (row + 1) / 4, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
++                    n += snprintf(line + n, sizeof line - size_t(n), " %02x%02x%02x", px[0], px[1], px[2]);
++                }
++        logmsg("%s", line);
++        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++    };
++    auto it = s_xfbs.find(s_lastXfb);
++    if (it != s_xfbs.end()) sample("XFB texture", it->second.tex, it->second.w, it->second.h);
++    else logmsg("[ES] frame %u: no XFB registered for the last picture", frame);
++    sample("EFB colour", s_efbColor, scaled(s_efbW), scaled(EFB_H));
++    for (int n = 0; n < 4; n++)
++        if (glGetError() == GL_NO_ERROR) break;
++}
++
++}  // namespace uwp
++}  // namespace gx
++#endif
+diff --git a/platform/gx/src/gx_shader.cpp b/platform/gx/src/gx_shader.cpp
+index fc0c77d..c1a81a7 100644
+--- a/platform/gx/src/gx_shader.cpp
++++ b/platform/gx/src/gx_shader.cpp
+@@ -5,6 +5,9 @@
+ #include "gx_internal.h"
+ #include "gx_glthread.h"
+ #include "gl_funcs.h"
++#ifdef SMS_GX_UWP_ANGLE
++#include "gx_uwp_egl.h"
++#endif
+ #include "gx_glcache.h"
+ 
+ #include <stdio.h>
+@@ -549,7 +552,12 @@ static std::string genFS(const ShaderKey& k) {
+ // ------------------------------------------------------------------ compile / cache
+ static GLuint compile(GLenum type, const std::string& src) {
+     GLuint sh = glCreateShader(type);
++#ifdef SMS_GX_UWP_ANGLE
++    const std::string es = uwp::toEs300(src.c_str());
++    const char* p = es.c_str();
++#else
+     const char* p = src.c_str();
++#endif
+     glShaderSource(sh, 1, &p, nullptr);
+     glCompileShader(sh);
+     GLint ok = 0;
+@@ -557,7 +565,7 @@ static GLuint compile(GLenum type, const std::string& src) {
+     if (!ok) {
+         char log[4096];
+         glGetShaderInfoLog(sh, sizeof log, nullptr, log);
+-        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, src.c_str());
++        logmsg("shader compile failed:\n%s\n--- source ---\n%s", log, p);
+     }
+     return sh;
+ }
+@@ -839,7 +847,12 @@ static std::vector<Warmed> s_warmed;
+ 
+ static GLuint startCompile(GLenum type, const std::string& src) {
+     GLuint sh = glCreateShader(type);
++#ifdef SMS_GX_UWP_ANGLE
++    const std::string es = uwp::toEs300(src.c_str());
++    const char* p = es.c_str();
++#else
+     const char* p = src.c_str();
++#endif
+     glShaderSource(sh, 1, &p, nullptr);
+     glCompileShader(sh);
+     return sh;
+@@ -1127,7 +1140,9 @@ const ShaderProgram* shaderForCurrentState(bool depthOnly, bool lines) {
+     k.depthOnly = depthOnly;
+     key.indScale[0] = k.numInd ? g.bp[BP_RAS1_SS0] : 0;
+     key.indScale[1] = k.numInd ? g.bp[BP_RAS1_SS0 + 1] : 0;
++#ifndef SMS_GX_UWP_ANGLE  // the line quads come from a geometry shader, which this ES 3.0 context lacks: 1-pixel lines
+     if (lines) return lineProgram(key);
++#endif
+     // consecutive batches mostly share a program
+     if (s_lastProgram && key == s_lastKey) return s_lastProgram;
+     recordKey(key);

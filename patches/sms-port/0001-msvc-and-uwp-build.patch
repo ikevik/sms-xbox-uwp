@@ -1,0 +1,411 @@
+diff --git a/.gitignore b/.gitignore
+index 8083f01..784b8f5 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,7 +6,8 @@
+ # Output folders of earlier layouts.
+ /build-*/
+ /build32/
+-/third_party/
++/third_party/*
++!/third_party/angle-uwp/
+ .DS_Store
+ # The achievement icons, downloaded by tools/mods/get.py achievement-icons.
+ /assets/achievements/
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d7f657d..b6de2ec 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,6 +2,35 @@ cmake_minimum_required(VERSION 3.20)
+ project(sms_port C CXX)
+ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+ 
++# clang targeting Windows with the MSVC runtime (also the UWP route): no pthread, no
++# POSIX headers. src/win_posix supplies the few the port uses, force-included and found
++# first on the include path. MinGW and the other hosts have them natively.
++set(SMS_MSVC_TARGET OFF)
++if(WIN32 AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
++  set(SMS_MSVC_TARGET ON)
++  add_compile_definitions(NOMINMAX _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS
++    _CRT_NONSTDC_NO_DEPRECATE _CRT_DECLARE_NONSTDC_NAMES=1)
++  include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/src/win_posix)
++  add_compile_options("SHELL:-include \"${CMAKE_CURRENT_SOURCE_DIR}/src/win_posix/win_posix.h\"")
++  message(STATUS "SMS port: msvc-target build, POSIX shim from src/win_posix")
++endif()
++
++# UWP (Xbox Dev Mode): the store family of Windows APIs, AppContainer, WindowsApp.lib in place of
++# kernel32 and the rest. Needs the store environment (vcvarsall x64 uwp). SDL2 has no clang-buildable
++# WinRT backend: the window, pad and sound are src/uwp (ANGLE through gx_uwp_egl.cpp, Windows.Gaming.Input, XAudio2).
++option(SMS_UWP "Target UWP (needs SMS_MSVC_TARGET)" OFF)
++if(SMS_UWP)
++  if(NOT SMS_MSVC_TARGET)
++    message(FATAL_ERROR "SMS_UWP needs clang targeting Windows with the MSVC runtime")
++  endif()
++  add_compile_definitions(WINAPI_FAMILY=WINAPI_FAMILY_APP __WRL_NO_DEFAULT_LIB__ _WIN32_WINNT=0x0A00 SMS_UWP=1)
++  # No linking in the configure-time checks, and only the store umbrella library afterwards.
++  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
++  set(CMAKE_C_STANDARD_LIBRARIES "-lWindowsApp.lib -loldnames")
++  set(CMAKE_CXX_STANDARD_LIBRARIES "-lWindowsApp.lib -loldnames")
++  message(STATUS "SMS port: UWP target")
++endif()
++
+ # MinGW's own include folder is one of the compiler's system folders, which
+ # CMake leaves off command lines. CMake reads that list from the compiler's
+ # output and misses the folder when its path isn't ASCII (a Windows user name
+@@ -104,6 +133,10 @@ include(${CMAKE_BINARY_DIR}/decomp_sources.cmake)
+ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches.cmake)
+ 
+ set(SMS_COMMON_DEFS GEKKO TARGET_PC VERSION_GMSE01 BUILD_VERSION=2 NDEBUG=1)
++# The C++ standards the game and the platform layer compile as. The defaults are what
++# every build has used; MSVC's own headers need C++14 or later (-DSMS_GAME_CXX_STD=gnu++14).
++set(SMS_GAME_CXX_STD "gnu++03" CACHE STRING "C++ standard for the decomp's game code")
++set(SMS_PLATFORM_CXX_STD "gnu++11" CACHE STRING "C++ standard for the platform layer")
+ set(SMS_GAME_FLAGS
+   -w -fno-strict-aliasing -fwrapv -fno-omit-frame-pointer
+   # Retail MSL has no _FORTIFY_SOURCE checks (Ubuntu g++ enables them at -O1+;
+@@ -112,7 +145,7 @@ set(SMS_GAME_FLAGS
+   -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector
+   # Float math without contraction (Gekko-like). SSE is x86-only; arm64 uses NEON.
+   -ffp-contract=off
+-  $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
++  $<$<COMPILE_LANGUAGE:CXX>:-std=${SMS_GAME_CXX_STD} -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
+   $<$<COMPILE_LANGUAGE:C>:-std=gnu99 -fcommon>
+   -include ${SMS_PORT_SRC}/port_compat.h)
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i.86)$" OR CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+@@ -144,6 +177,14 @@ endif()
+ # memory stays below 4 GiB (port_low_alloc), so nothing is lost.
+ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+   list(APPEND SMS_GAME_FLAGS -fms-extensions)
++  if(SMS_MSVC_TARGET)
++    # The game's operator new (JKRHeap::alloc, 4-byte alignment) is not what clang takes the global one to be: it assumes
++    # the 16 bytes the C++ library's new gives and stores zeros into new objects with movaps, which faults on a UWP
++    # console (TMario::initModel, exception 0x80000002) when the heap hands out an address that is only 8-aligned.
++    list(APPEND SMS_GAME_FLAGS $<$<COMPILE_LANGUAGE:CXX>:-fnew-alignment=4>)
++  endif()
++  # C++11 made narrowing in braces and case labels an error; the game relies on the C++03 rule.
++  list(APPEND SMS_GAME_FLAGS $<$<COMPILE_LANGUAGE:CXX>:-Wno-c++11-narrowing>)
+ endif()
+ 
+ # macOS: x86_64 (Rosetta on Apple Silicon) with a 4 KiB PAGEZERO, so game
+@@ -377,8 +418,23 @@ else()
+   set(_object_prefix "")
+   set(SMS_OBJCOPY objcopy)
+ endif()
+-file(WRITE ${CMAKE_BINARY_DIR}/game_new_syms.txt
+-  "${_object_prefix}_Znw${_sz} __sms_game_new\n${_object_prefix}_Zna${_sz} __sms_game_new_array\n${_object_prefix}_ZdlPv __sms_game_delete\n${_object_prefix}_ZdaPv __sms_game_delete_array\n")
++if(SMS_MSVC_TARGET)
++  # MSVC-ABI names (x64) of operator new, new[], delete, delete[] and the sized delete; GNU
++  # objcopy's Itanium names do not apply, and llvm-objcopy edits COFF archives.
++  get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
++  find_program(SMS_LLVM_OBJCOPY NAMES llvm-objcopy PATHS "${_llvm_bin}" NO_DEFAULT_PATH)
++  if(SMS_LLVM_OBJCOPY)
++    set(SMS_OBJCOPY "${SMS_LLVM_OBJCOPY}")
++  else()
++    message(WARNING "llvm-objcopy not found beside ${CMAKE_CXX_COMPILER}: the game's operator new is NOT renamed, and the result will not run")
++    set(SMS_OBJCOPY ${CMAKE_COMMAND} -E echo "skipped: llvm-objcopy missing")
++  endif()
++  file(WRITE ${CMAKE_BINARY_DIR}/game_new_syms.txt
++    "??2@YAPEAX_K@Z __sms_game_new\n??_U@YAPEAX_K@Z __sms_game_new_array\n??3@YAXPEAX@Z __sms_game_delete\n??_V@YAXPEAX@Z __sms_game_delete_array\n??3@YAXPEAX_K@Z __sms_game_delete\n??_V@YAXPEAX_K@Z __sms_game_delete_array\n")
++else()
++  file(WRITE ${CMAKE_BINARY_DIR}/game_new_syms.txt
++    "${_object_prefix}_Znw${_sz} __sms_game_new\n${_object_prefix}_Zna${_sz} __sms_game_new_array\n${_object_prefix}_ZdlPv __sms_game_delete\n${_object_prefix}_ZdaPv __sms_game_delete_array\n")
++endif()
+ add_custom_command(TARGET sms_game POST_BUILD
+   COMMAND ${SMS_OBJCOPY} --redefine-syms=${CMAKE_BINARY_DIR}/game_new_syms.txt $<TARGET_FILE:sms_game>
+   COMMENT "Renaming the game's global operator new/delete")
+@@ -397,7 +453,28 @@ list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/tests/")
+ if(WIN32 OR APPLE)
+   list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/trace/trace\\.cpp$")
+ endif()
++if(SMS_UWP)
++  # Desktop-only: replaced by src/win_posix/uwp_stubs.cpp
++  list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/os/windows_crash\\.cpp$")
++  list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/pad/gc_adapter\\.cpp$")
++endif()
+ add_executable(sms ${SMS_PORT_SRC}/port_main.cpp ${SMS_PLATFORM_SOURCES})
++if(SMS_MSVC_TARGET)
++  target_sources(sms PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/win_posix/win_posix.cpp)
++  target_compile_definitions(sms PRIVATE SMS_PLATFORM_UNIT=1)
++  if(SMS_UWP)
++    target_sources(sms PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/win_posix/uwp_stubs.cpp
++                   ${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_input.cpp
++                   ${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_audio.cpp)
++    # The WinRT entry (C++/WinRT needs C++17 or later) starts the game's main, renamed here.
++    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_input.cpp
++                                ${CMAKE_CURRENT_SOURCE_DIR}/src/uwp/uwp_audio.cpp
++                                PROPERTIES COMPILE_OPTIONS "-std=gnu++20")
++    # The audio output (src/uwp/uwp_audio.cpp): XAudio2 2.9, a system DLL a UWP app may import.
++    target_link_libraries(sms PRIVATE xaudio2.lib)
++    set_source_files_properties(${SMS_PORT_SRC}/port_main.cpp PROPERTIES COMPILE_DEFINITIONS "main=sms_game_main")
++  endif()
++endif()
+ # MSL's maths and the MTX/VEC library round every operation to single or
+ # double as the Gekko does: SSE on x86 (never x87 extended precision) and no
+ # contraction (their fused multiply-adds are explicit), on every host.
+@@ -433,9 +510,20 @@ target_include_directories(sms PRIVATE
+   ${SMS_PORT_SRC}/port_include ${SMS_DECOMP_INCLUDE_DIRS})
+ target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} SMS_AUDIO_DSP_HLE=1)
+ target_compile_options(sms PRIVATE -fno-strict-aliasing -Wno-unused-parameter -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+-  $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++11>)
++  $<$<COMPILE_LANGUAGE:CXX>:-std=${SMS_PLATFORM_CXX_STD}>)
+ # dsptask.c points a DSP task at the fixed low-memory address 0x80004600.
+-if(WIN32)
++if(SMS_MSVC_TARGET)
++  # lld-link has no --defsym: win_symbols.cpp defines lbl_80004600 as an absolute symbol.
++  # Game pointers pass through u32 slots, so the image must load below 4 GiB. UWP forbids
++  # /DYNAMICBASE:NO (LNK1295), so ASLR stays on and /HIGHENTROPYVA:NO keeps it in the low
++  # range; the image then moves between runs (save states assume fixed addresses).
++  target_sources(sms PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/win_posix/win_symbols.cpp)
++  target_link_options(sms PRIVATE -Wl,/BASE:0x400000 -Wl,/HIGHENTROPYVA:NO)
++  if(SMS_UWP)
++    # A UWP image runs in an AppContainer; its entry is wWinMain (src/uwp/uwp_main.cpp).
++    target_link_options(sms PRIVATE -Wl,/APPCONTAINER -Wl,/SUBSYSTEM:WINDOWS)
++  endif()
++elseif(WIN32)
+   target_link_options(sms PRIVATE "-Wl,--defsym=${_object_prefix}lbl_80004600=0x80004600")
+   if(SMS_ARCH STREQUAL "32")
+     # At its preferred address every run, for save states (see -fno-pie above).
+@@ -481,14 +569,22 @@ endif()
+ # they are, and tools/savestate_ranges.py writes that into the executable.
+ if(APPLE)
+   target_link_options(sms PRIVATE "LINKER:-map,${CMAKE_BINARY_DIR}/sms.map")
++elseif(SMS_MSVC_TARGET)
++  target_link_options(sms PRIVATE "-Wl,/MAP:${CMAKE_BINARY_DIR}/sms.map")
+ else()
+   target_link_options(sms PRIVATE "LINKER:-Map=${CMAKE_BINARY_DIR}/sms.map")
+ endif()
++if(SMS_MSVC_TARGET)
++  # savestate_ranges.py reads GNU ld and ld64 maps, not lld-link's: save states are not
++  # supported on this target until it does.
++  message(STATUS "SMS port: save states are not recorded on the msvc target")
++else()
+ add_custom_command(TARGET sms POST_BUILD
+   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/savestate_ranges.py
+     --map ${CMAKE_BINARY_DIR}/sms.map --exe $<TARGET_FILE:sms>
+     --archive libsms_game.a --archive libsms_eclipse.a
+   COMMENT "Recording the game's data for save states")
++endif()
+ if(SMS_MAC_ARM64)
+   # That rewrote the executable after the linker signed it, and arm64 macOS
+   # kills a process whose signature does not match: sign it again (ad hoc).
+@@ -537,6 +633,16 @@ if(APPLE)
+     target_link_libraries(sms PRIVATE sms_gx)
+     add_dependencies(sms sms_gx)
+   endif()
++elseif(SMS_MSVC_TARGET)
++  # lld-link: /WHOLEARCHIVE pulls every member (the GNU --whole-archive is ignored), which
++  # lets the strong GXPC_* definitions replace the weak references in the platform layer.
++  # Windows threads need no library; FindThreads names -lpthreads when it cannot link a test (UWP).
++  target_link_libraries(sms PRIVATE sms_game)
++  target_link_options(sms PRIVATE "-Wl,/WHOLEARCHIVE:$<TARGET_FILE:sms_game>")
++  if(TARGET sms_gx)
++    target_link_libraries(sms PRIVATE sms_gx)
++    target_link_options(sms PRIVATE "-Wl,/WHOLEARCHIVE:$<TARGET_FILE:sms_gx>")
++  endif()
+ else()
+   target_link_libraries(sms PRIVATE -Wl,--whole-archive sms_game -Wl,--no-whole-archive Threads::Threads m ${CMAKE_DL_LIBS})
+   if(TARGET sms_gx)
+@@ -559,6 +665,9 @@ endif()
+ option(SMS_ECLIPSE "Build Super Mario Eclipse in (fetches its sources, see docs/ECLIPSE.md)" OFF)
+ if(SMS_ECLIPSE)
+   include(cmake/eclipse.cmake)
++elseif(SMS_MSVC_TARGET)
++  # No null weak imports on COFF: the optional mod tables are empty stand-ins instead
++  # (decomp-patches/zzzzzz-msvc-mod-table-stand-ins.patch).
+ elseif(WIN32)
+   # COFF x64 does not resolve these optional weak data imports to null.
+   # Only standard Sunshine uses null imports; Eclipse must supply real ones.
+diff --git a/ext/coop/game/coop.cpp b/ext/coop/game/coop.cpp
+index 2d8b1c9..ad49a9b 100644
+--- a/ext/coop/game/coop.cpp
++++ b/ext/coop/game/coop.cpp
+@@ -62,7 +62,11 @@ void port_coop_join_virtual(void);
+ extern int port_coop_in_p2;
+ // platform/gx
+ void GXPC_SetSplitView(int on, float x, float y, float w, float h) __attribute__((weak));
++#ifdef _MSC_VER
++extern "C" void GXPC_ExtOverlaySet(int panel, const char* text);  // COFF: no weak undefined; sms_gx is always linked
++#else
+ void GXPC_ExtOverlaySet(int panel, const char* text) __attribute__((weak));
++#endif
+ // ext/multiplayer/game/mp_spawn.cpp: the stage's scene.bin records
+ int port_spawn_record_of(const void* object, const void** record, unsigned* size);
+ // decomp-patches/zzzzzz-coop-01: ViewFrustumClipCheck's other view
+diff --git a/ext/multiplayer/game/mp_game.cpp b/ext/multiplayer/game/mp_game.cpp
+index 591725a..d20a361 100644
+--- a/ext/multiplayer/game/mp_game.cpp
++++ b/ext/multiplayer/game/mp_game.cpp
+@@ -86,7 +86,11 @@
+ #include <string.h>
+ 
+ // The window's text panels (platform/gx; absent in a build without a window).
++#ifdef _MSC_VER
++extern "C" void GXPC_ExtOverlaySet(int panel, const char* text);  // COFF: no weak undefined; sms_gx is always linked
++#else
+ extern "C" void GXPC_ExtOverlaySet(int panel, const char* text) __attribute__((weak));
++#endif
+ extern "C" void GXPC_ExtOverlayLabels(const GXPCLabel* labels, int count) __attribute__((weak));
+ enum { OVERLAY_NOTICE = 0, OVERLAY_STATUS = 1 };
+ 
+diff --git a/ext/multiplayer/game/mp_server.cpp b/ext/multiplayer/game/mp_server.cpp
+index 121c4fe..88bb1eb 100644
+--- a/ext/multiplayer/game/mp_server.cpp
++++ b/ext/multiplayer/game/mp_server.cpp
+@@ -47,7 +47,11 @@
+ #include <string.h>
+ #include <time.h>
+ 
++#ifdef _MSC_VER
++extern "C" void GXPC_ExtOverlaySet(int panel, const char* text);  // COFF: no weak undefined; sms_gx is always linked
++#else
+ extern "C" void GXPC_ExtOverlaySet(int panel, const char* text) __attribute__((weak));
++#endif
+ extern "C" void GXPC_ExtOverlayMarkers(const GXPCMarker* markers, int count) __attribute__((weak));
+ extern "C" void GXPC_ExtOverlayScreen(uint32_t rgba) __attribute__((weak));
+ void MpShowNotice(const char* text); // mp_game.cpp
+diff --git a/platform/mtx/mtx.cpp b/platform/mtx/mtx.cpp
+index 5aed54d..4d3c8e8 100644
+--- a/platform/mtx/mtx.cpp
++++ b/platform/mtx/mtx.cpp
+@@ -128,11 +128,28 @@ namespace mtx_fma {
+ extern "C" {
+ int sms_mtx_hw_fma = -1;
+ }
++#if defined(_MSC_VER)
++#include <intrin.h>
++// clang's __builtin_cpu_supports needs compiler-rt's __cpu_model, which the msvc-target link
++// does not have: ask CPUID, and XGETBV for the OS saving the AVX state.
++__attribute__((target("xsave"))) static int mtx_cpu_has_fma()
++{
++	int r[4];
++	__cpuid(r, 1);
++	const bool fma = (r[2] >> 12) & 1, osxsave = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1;
++	return fma && osxsave && avx && (_xgetbv(0) & 6) == 6;
++}
++#else
++static int mtx_cpu_has_fma()
++{
++	__builtin_cpu_init();
++	return __builtin_cpu_supports("fma") ? 1 : 0;
++}
++#endif
+ static int mtx_init_fma()
+ {
+ 	const char* e = getenv("SMS_MTX_SOFT_FMA");
+-	__builtin_cpu_init();
+-	sms_mtx_hw_fma = (e && *e == '1') ? 0 : __builtin_cpu_supports("fma") ? 1 : 0;
++	sms_mtx_hw_fma = (e && *e == '1') ? 0 : mtx_cpu_has_fma();
+ 	return sms_mtx_hw_fma;
+ }
+ static inline bool mtx_have_fma()
+diff --git a/platform/os/crash_info.cpp b/platform/os/crash_info.cpp
+index 56ff7cc..33632c8 100644
+--- a/platform/os/crash_info.cpp
++++ b/platform/os/crash_info.cpp
+@@ -87,7 +87,15 @@ void port_crash_emit(PortCrashLine& line)
+ 
+ bool port_crash_read(void* to, uintptr_t from, size_t size)
+ {
+-#ifdef _WIN32
++#if defined(_WIN32) && defined(SMS_UWP)
++	// ReadProcessMemory is not a UWP API: copy under structured exception handling instead.
++	__try {
++		memcpy(to, (const void*)from, size);
++		return true;
++	} __except (EXCEPTION_EXECUTE_HANDLER) {
++		return false;
++	}
++#elif defined(_WIN32)
+ 	SIZE_T copied = 0;
+ 	return ReadProcessMemory(GetCurrentProcess(), (const void*)from, to, size, &copied) && copied == size;
+ #elif defined(__APPLE__)
+diff --git a/platform/os/os_thread.cpp b/platform/os/os_thread.cpp
+index 695474a..a85486d 100644
+--- a/platform/os/os_thread.cpp
++++ b/platform/os/os_thread.cpp
+@@ -189,7 +189,14 @@ LowStack* low_stack()
+ void* windows_host_entry(void* argument)
+ {
+ 	LowStack* stack = (LowStack*)argument;
+-	return port_win64_stack_call(stack->base, kLowStackSize, host_entry, stack->argument);
++#ifdef SMS_UWP
++	port_log("[os] host thread %p starts on the low stack at %p\n", (void*)pthread_self(), stack->base);
++#endif
++	void* result = port_win64_stack_call(stack->base, kLowStackSize, host_entry, stack->argument);
++#ifdef SMS_UWP
++	port_log("[os] host thread %p is back on its own stack and ends\n", (void*)pthread_self());
++#endif
++	return result;
+ }
+ #endif
+ #endif
+@@ -677,6 +684,9 @@ extern "C" int OSCreateThread(OSThread* t, void* (*func)(void*), void* param, vo
+ 	h->arg       = param;
+ 	h->started   = false;
+ 	h->cancelled = false;
++#ifdef SMS_UWP
++	port_log("[os] OSCreateThread %p: entry %p, priority %d\n", (void*)t, (void*)(uintptr_t)func, (int)prio);
++#endif
+ 	return TRUE;
+ }
+ 
+@@ -685,6 +695,9 @@ extern "C" void OSExitThread(OSThread* valArg)
+ {
+ 	void* val      = valArg;
+ 	OSThread* self = g_cur;
++#ifdef SMS_UWP
++	port_log("[os] OSExitThread %p\n", (void*)self);
++#endif
+ 	self->val      = val;
+ 	self->state    = OS_THREAD_STATE_MORIBUND;
+ 	OSWakeupThread(&self->queueJoin);
+@@ -703,6 +716,9 @@ extern "C" void OSExitThread(OSThread* valArg)
+ 
+ extern "C" void OSCancelThread(OSThread* t)
+ {
++#ifdef SMS_UWP
++	port_log("[os] OSCancelThread %p (running %p)\n", (void*)t, (void*)g_cur);
++#endif
+ 	if (t == g_cur) {
+ 		OSExitThread(NULL);
+ 		return;
+diff --git a/src/port_compat.h b/src/port_compat.h
+index 47c77bf..e446cd8 100644
+--- a/src/port_compat.h
++++ b/src/port_compat.h
+@@ -27,6 +27,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <cstdio>
++#include <cctype>
+ #include <algorithm>
+ #include <iterator>
+ #include <utility>
+@@ -34,8 +35,11 @@
+ 
+ /* The decomp's configure.py passes -Dnullptr=0: nullptr is a plain 0, which
+  * the game also assigns to integer fields (MActorAnmBck::unk28). Before C++11
+- * it is no keyword (libc++ on macOS defines it as __nullptr in C++03 mode). */
+-#if !defined(__cplusplus) || __cplusplus < 201103L
++ * it is no keyword (libc++ on macOS defines it as __nullptr in C++03 mode).
++ * MSVC's headers need C++14, so there it is the real keyword until here (every
++ * system header is included above) and a plain 0 from here on, as the game expects.
++ * The platform layer (SMS_PLATFORM_UNIT) includes STL headers after this, which need the keyword. */
++#if !defined(__cplusplus) || __cplusplus < 201103L || (defined(_MSC_VER) && !defined(SMS_PLATFORM_UNIT))
+ #undef nullptr
+ #define nullptr 0
+ #endif
+diff --git a/src/port_include/sms_modhook.h b/src/port_include/sms_modhook.h
+index 5423f5a..3e511db 100644
+--- a/src/port_include/sms_modhook.h
++++ b/src/port_include/sms_modhook.h
+@@ -20,6 +20,9 @@
+ #ifdef TARGET_PC
+ #if defined(__APPLE__)
+ #define SMS_MOD_WEAK_IMPORT __attribute__((weak_import))
++#elif defined(_MSC_VER)
++/* COFF has no weak data imports: the tables are stand-ins (see MarioDraw.cpp) */
++#define SMS_MOD_WEAK_IMPORT
+ #else
+ #define SMS_MOD_WEAK_IMPORT __attribute__((weak))
+ #endif

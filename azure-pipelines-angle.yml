@@ -1,0 +1,57 @@
+# (Runs from overlay/, where tools/ci is; the result goes into overlay/third_party/angle-uwp by hand.)
+# Manual job: build ANGLE (OpenGL ES over Direct3D 11) for UWP x64.
+# Create a pipeline from this file and run it by hand. The angle-uwp artifact holds bin/ (libEGL.dll,
+# libGLESv2.dll, d3dcompiler_47.dll), lib/ (import libraries), include/ (EGL, GLES2, GLES3, KHR),
+# ANGLE_REF.txt, RESULT.txt and the logs.
+#
+# Time: a hosted job in a private Azure DevOps project stops at 60 minutes, which the checkout and the
+# build exceed. Either make the project public (the job limit is then 360 minutes, with more cores; set
+# ninjaMinutes to about 300), or keep it private, tick useCache and run the pipeline again until
+# RESULT.txt says COMPLETE: the checkout and out\uwp are then saved between runs. (The cache task has
+# crashed on the first miss in this project, hence it is off by default.)
+trigger: none
+pr: none
+
+parameters:
+- name: angleRef
+  displayName: ANGLE branch, tag or commit
+  type: string
+  default: 39087422740112ef2f3be57a6af1ed8399459f69   # the commit that built completely (libEGL and libGLESv2); main moves
+- name: ninjaMinutes
+  displayName: 'Minutes to build before stopping (private project: 35)'
+  type: number
+  default: 35
+- name: useCache
+  displayName: Cache the checkout and build between runs
+  type: boolean
+  default: false
+
+jobs:
+- job: angle_uwp
+  displayName: ANGLE for UWP x64
+  timeoutInMinutes: 360
+  pool:
+    vmImage: windows-2022
+  steps:
+  - checkout: self
+    fetchDepth: 1
+    submodules: false
+
+  - ${{ if eq(parameters.useCache, true) }}:
+    - task: Cache@2
+      displayName: Restore ANGLE's checkout and build output
+      inputs:
+        key: 'angle | "$(Agent.OS)" | ${{ parameters.angleRef }} | $(Build.BuildId)'
+        restoreKeys: |
+          angle | "$(Agent.OS)" | ${{ parameters.angleRef }}
+        path: $(Pipeline.Workspace)\angle
+      continueOnError: true
+
+  - powershell: ./tools/ci/build_angle.ps1 -Ref '${{ parameters.angleRef }}' -TimeoutMin ${{ parameters.ninjaMinutes }} -Tree '$(Pipeline.Workspace)\angle'
+    displayName: Fetch and build ANGLE
+    workingDirectory: overlay
+    continueOnError: true
+
+  - publish: overlay/angle-uwp
+    artifact: angle-uwp
+    condition: always()

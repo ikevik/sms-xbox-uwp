@@ -1,0 +1,46 @@
+# Manual job: build the game for UWP (the Xbox) with clang targeting Windows (msvc).
+# Create a pipeline from this file and run it by hand with "Target UWP" ticked. The clang-survey artifact
+# holds bin/ (sms.exe, sms.map, sms-pc-port-uwp.msix, SmsDev.cer, the VCLibs framework package), summary.md
+# and the full logs.
+#
+# The build runs in build/pcport-uwp: the sms-pc-port submodule with patches/sms-port/ applied and overlay/
+# copied over it (scripts/prepare.sh), so the CI scripts below are the ones the fork used, unchanged.
+trigger: none
+pr: none
+
+parameters:
+- name: uwp
+  displayName: Target UWP (store libraries, AppContainer)
+  type: boolean
+  default: false
+
+jobs:
+- job: clang_survey
+  displayName: Clang (msvc target) build
+  timeoutInMinutes: 60
+  pool:
+    vmImage: windows-2022
+  steps:
+  # No CRLF conversion on checkout: the patches must match the sources byte for byte.
+  - script: git config --global core.autocrlf false
+    displayName: Keep line endings as committed
+
+  - checkout: self
+    submodules: recursive   # ext/sms-pc-port, and its decomp and sdk
+
+  # Git's own patch and tar, not Strawberry Perl's patch.exe, which asserts on patches (see tools/ci/clang_survey.ps1).
+  - powershell: |
+      $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and $_ -notmatch 'Strawberry' }) -join ';'
+      $env:PATH = "$env:ProgramFiles\Git\usr\bin;$env:PATH"
+      & "$env:ProgramFiles\Git\bin\bash.exe" scripts/prepare.sh
+      if ($LASTEXITCODE) { exit $LASTEXITCODE }
+    displayName: Prepare the sms-pc-port tree (submodule, patches, overlay)
+
+  - powershell: ./tools/ci/clang_survey.ps1 -Build build-clang -Uwp:$${{ parameters.uwp }}
+    displayName: Build with clang (msvc target)
+    workingDirectory: build/pcport-uwp
+    continueOnError: true
+
+  - publish: build/pcport-uwp/build-clang-survey
+    artifact: clang-survey
+    condition: always()
