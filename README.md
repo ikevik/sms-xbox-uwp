@@ -26,8 +26,11 @@ yes/no. See [overlay/docs/UWP-GRAPHICS.md](overlay/docs/UWP-GRAPHICS.md).
 
 ## Installing
 
-You need an Xbox in Dev Mode, with the Device Portal on, and your own Super Mario Sunshine disc image: USA
-(GMSE01), a plain `.iso` (a `.gcm` or `.ciso` works too).
+You need an Xbox in Developer Mode (see
+[Xbox Developer Mode activation](https://learn.microsoft.com/en-us/windows/uwp/xbox-apps/devkit-activation) on
+Microsoft Learn, and [docs/BUILDING-ON-WINDOWS.md](docs/BUILDING-ON-WINDOWS.md#getting-an-xbox-into-dev-mode) for
+the short version), with the [Device Portal](https://learn.microsoft.com/en-us/windows/uwp/xbox-apps/device-portal-xbox)
+on, and your own Super Mario Sunshine disc image: USA (GMSE01), a plain `.iso` (a `.gcm` or `.ciso` works too).
 
 1. Run the **clang** pipeline (`azure-pipelines-clang.yml`) with *Target UWP* ticked, and download the
    `clang-survey` artifact. Its `bin/` holds `sms-pc-port-uwp.msix`, the certificate it is signed with
@@ -45,8 +48,9 @@ uninstalling the app; delete `menu-settings.txt` to go back to the default setti
 
 ## Building
 
-Builds run on Azure Pipelines (`windows-2022`, clang targeting Windows with the store libraries); this machine
-cannot build them. The steps:
+Builds run on Azure Pipelines (`windows-2022`, clang targeting Windows with the store libraries): how that is
+set up and used is in [docs/AZURE-DEVOPS.md](docs/AZURE-DEVOPS.md). To build on a Windows PC instead, see
+[docs/BUILDING-ON-WINDOWS.md](docs/BUILDING-ON-WINDOWS.md); a Mac or Linux machine cannot build it. The steps:
 
 ```
 git clone --recursive <this repository>
