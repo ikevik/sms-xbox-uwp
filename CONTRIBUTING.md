@@ -6,7 +6,8 @@ Pull requests and bug reports are welcome.
 
 - **The submodule is never edited.** A change to a file of sms-pc-port goes in a patch in `patches/sms-port/`;
   a new file goes in `overlay/`, at the path it has in the tree. `scripts/prepare.sh` builds `build/pcport-uwp`
-  from them, and that is where the build and the CI scripts run.
+  from them, and that is where the build and the CI scripts run. Do not write the patches by hand: edit in the
+  workspace (`scripts/dev_workspace.sh`, then `scripts/save_patches.sh`; see the README's *Changing the code*).
 - **Changes that are not about the console** (a fix in the PC port itself) belong upstream, in
   [chasem-dev/sms-pc-port](https://github.com/chasem-dev/sms-pc-port); a patch here should only carry what the
   UWP build needs.

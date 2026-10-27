@@ -1,0 +1,25 @@
+# Which patch in patches/sms-port/ each edited file of sms-pc-port belongs to: the patch's name, a tab, the file.
+# scripts/save_patches.sh reads this; an edited file that is not listed goes into 0099-other. Move a file to
+# another patch by changing its line.
+0001-msvc-and-uwp-build	.gitignore
+0001-msvc-and-uwp-build	CMakeLists.txt
+0001-msvc-and-uwp-build	src/port_compat.h
+0001-msvc-and-uwp-build	src/port_include/sms_modhook.h
+0001-msvc-and-uwp-build	platform/mtx/mtx.cpp
+0001-msvc-and-uwp-build	platform/os/crash_info.cpp
+0001-msvc-and-uwp-build	platform/os/os_thread.cpp
+0001-msvc-and-uwp-build	ext/coop/game/coop.cpp
+0001-msvc-and-uwp-build	ext/multiplayer/game/mp_game.cpp
+0001-msvc-and-uwp-build	ext/multiplayer/game/mp_server.cpp
+0002-uwp-angle-renderer	platform/gx/CMakeLists.txt
+0002-uwp-angle-renderer	platform/gx/src/gl_loader.cpp
+0002-uwp-angle-renderer	platform/gx/src/gx_render.cpp
+0002-uwp-angle-renderer	platform/gx/src/gx_platform.cpp
+0002-uwp-angle-renderer	platform/gx/src/gx_shader.cpp
+0002-uwp-angle-renderer	platform/gx/src/gx_hdr.cpp
+0002-uwp-angle-renderer	platform/gx/src/gx_hires.cpp
+0003-uwp-xaudio2-output	platform/audio/ai.cpp
+0004-saves-and-menu-settings	platform/card/card.cpp
+0004-saves-and-menu-settings	platform/misc/port_settings.cpp
+0004-saves-and-menu-settings	src/port_include/port_settings.h
+0004-saves-and-menu-settings	platform/vi/vi.cpp

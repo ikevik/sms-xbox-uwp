@@ -61,12 +61,28 @@ then, on Windows with Visual Studio's UWP tools, LLVM clang, CMake and Ninja, in
 | `ext/sms-pc-port/` | the PC port (submodule, with its own `decomp/` and `sdk/`), pinned |
 | `patches/sms-port/` | this port's edits to files of the PC port, as patches applied in name order |
 | `overlay/` | files this port adds, at the paths they have in the tree: `src/uwp/` (the WinRT entry, controller, XAudio2), `src/win_posix/` (the POSIX shim for the msvc target), `platform/gx/src/gx_uwp_egl.*` (ANGLE), `third_party/angle-uwp/` (prebuilt ANGLE), `tools/ci/`, `tools/uwp/` (the manifest), `tools/uwp-probe/`, `decomp-patches/` |
-| `scripts/` | `prepare.sh`; and, while the work is still done in the fork, `regenerate_patches.sh` and `verify_against_fork.sh` |
-| `azure-pipelines*.yml` | the clang build, the ANGLE build and the UWP probe |
+| `scripts/` | `prepare.sh` (the tree CI builds); `dev_workspace.sh` and `save_patches.sh` (the way to change code, below) |
+| `azure-pipelines*.yml` | the clang build (the one that makes the Xbox package), the ANGLE build and the UWP probe |
 
-While the work is still done in the fork ([ikevik/sms-pc-port](https://github.com/ikevik/sms-pc-port), branch
-`uwp-xbox`), `scripts/regenerate_patches.sh` rebuilds `patches/sms-port/` and `overlay/` from it, and
-`scripts/verify_against_fork.sh` checks that the prepared tree is byte for byte the fork's.
+## Changing the code
+
+The PC port's files are never edited in place; a change is made in a workspace and saved as patches:
+
+```
+scripts/dev_workspace.sh      # build/pcport-dev: the prepared tree as a git repository (tags: pristine, prepared)
+# edit files in build/pcport-dev; git status / git diff / git log there show what you changed
+scripts/save_patches.sh       # rebuilds patches/sms-port/ and overlay/ from the difference to "pristine"
+git status && git diff        # review, then commit and push
+```
+
+A changed file of sms-pc-port goes into the patch `patches/groups.txt` names for it (0099-other if none), a new
+file goes into `overlay/` at its path. Saving rebuilds the tree from the saved patches and overlay and checks that it
+is exactly the workspace. The game's own sources (`decomp/`) are not changed here: a change to them is a new patch
+file in `overlay/decomp-patches/`. A workspace that is behind `patches/` or `overlay/` (after a pull, say) is
+refused: make it again with `FORCE=1 scripts/dev_workspace.sh`.
+
+The work was first done in a fork, [ikevik/sms-pc-port](https://github.com/ikevik/sms-pc-port) (branch `uwp-xbox`,
+now archived), whose commits are the step-by-step record of how the port came about.
 
 The version line in `sms.log` (`[port] version: ... (abc1234)`) shows this repository's commit.
 
