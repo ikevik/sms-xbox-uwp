@@ -32,4 +32,12 @@
       </uap:VisualElements>
     </Application>
   </Applications>
+
+  <!-- Multiplayer (ext/multiplayer) is UDP: a game that hosts takes connections from the LAN and the internet,
+       a game that joins connects out. Without these the app container blocks all networking. -->
+  <Capabilities>
+    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+  </Capabilities>
 </Package>

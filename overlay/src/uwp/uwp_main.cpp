@@ -13,6 +13,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
@@ -164,8 +165,22 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                 const size_t eq = line.find('=');
                 if (eq == std::string::npos || eq == 0 || line[0] == '#')
                     continue;
-                _putenv_s(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str());
+                // {LocalState} stands for the app's LocalState folder (SMS_SAVE_DIR={LocalState}/sms-port/card-guest).
+                std::string value = line.substr(eq + 1);
+                for (size_t at; (at = value.find("{LocalState}")) != std::string::npos;)
+                    value.replace(at, 12, dir);
+                _putenv_s(line.substr(0, eq).c_str(), value.c_str());
                 fprintf(stderr, "[uwp] env.txt: %s\n", line.c_str());
+            }
+        }
+        // A multiplayer game: the addresses this console has, which a host gives to the players who join it.
+        if (getenv("SMS_MULTIPLAYER")) {
+            try {
+                for (auto const& host : Windows::Networking::Connectivity::NetworkInformation::GetHostNames())
+                    if (host.IPInformation())
+                        fprintf(stderr, "[uwp] network address: %ls\n", host.DisplayName().c_str());
+            } catch (hresult_error const& e) {
+                fprintf(stderr, "[uwp] no network addresses: %ls\n", e.message().c_str());
             }
         }
         g_args.push_back("sms");
