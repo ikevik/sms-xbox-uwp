@@ -13,6 +13,7 @@
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>  // begin() and end() of the address list below
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.h>
 #include <winrt/Windows.System.h>
